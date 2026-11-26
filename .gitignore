@@ -1,0 +1,39 @@
+# SwiftPM
+/.build/
+/.build-*/
+/.swiftpm/
+Package.resolved
+
+# Assembled app and release archives
+/build/
+/dist/
+*.dSYM
+
+# Xcode
+/*.xcodeproj
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+__pycache__/
+
+# Local databases and editor state
+*.db
+*.db-shm
+*.db-wal
+.env*
+/.claude/
+/.codex/
+/.agents/
+
+# Local-only notes and state from the earlier web version. Never publish them.
+/REPORT.md
+/research/
+/.sites-runtime/
+/.openai/
+/.wrangler/
+/node_modules/
+
+# Working copies used while agents build modules in parallel
+/.work/
