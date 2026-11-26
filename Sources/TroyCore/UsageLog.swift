@@ -193,6 +193,7 @@ public final class UsageLog: @unchecked Sendable {
     public func close() {
         lock.withLock {
             if state != .off, !queue.isEmpty {
+                // One shared second for opening and writing together.
                 flush(timeoutMillis: Self.closeTimeoutMillis, openBudget: Double(Self.closeTimeoutMillis) / 1000)
             }
             database?.close()
@@ -201,11 +202,20 @@ public final class UsageLog: @unchecked Sendable {
         }
     }
 
+    // MARK: Clock
+
+    /// A monotonic clock that no wall-clock change moves. All lock waiting is measured against it.
+    private static var uptime: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
     /// Writes the whole queue in one transaction. Called with the lock held.
+    /// Opening may take until `openBudget` seconds from now, and the write waits at most
+    /// `timeoutMillis` after the open, never past the deadline that opening started. SQLite itself
+    /// never waits (`busy_timeout` is 0 on this connection): the retrying loop owns all waiting.
     private func flush(timeoutMillis: Int, openBudget: TimeInterval) {
         guard !queue.isEmpty else { return }
+        let overall = Self.uptime + openBudget
         let db: Database
-        switch openIfNeeded(budget: openBudget) {
+        switch openIfNeeded(deadline: overall) {
         case .opened(let opened): db = opened
         case .busy:
             return
@@ -213,20 +223,24 @@ public final class UsageLog: @unchecked Sendable {
             turnOff()
             return
         }
+        let writeDeadline = min(overall, Self.uptime + Double(timeoutMillis) / 1000)
         do {
-            try db.execute("PRAGMA busy_timeout = \(timeoutMillis)")
-            try db.transaction {
-                for (index, row) in queue.enumerated() {
-                    var detail = row.event.detail
-                    if index == 0, dropped > 0 { detail = Self.adding(dropped: dropped, to: detail) }
-                    try insert(db, row.event, at: row.at, detail: detail)
+            // The first attempt is made at once; only a lock held elsewhere sends it round again,
+            // and the whole transaction is retried, never part of it.
+            try Self.retrying(db, until: writeDeadline) {
+                try db.transaction {
+                    for (index, row) in queue.enumerated() {
+                        var detail = row.event.detail
+                        if index == 0, dropped > 0 { detail = Self.adding(dropped: dropped, to: detail) }
+                        try insert(db, row.event, at: row.at, detail: detail)
+                    }
                 }
             }
             queue.removeAll()
             dropped = 0
         } catch {
-            // Busy: the rows stay queued for the next call. Anything else will not heal.
-            if !db.lastFailureWasBusy { turnOff() }
+            // Busy: the rows (and the dropped count) stay queued for the next call. Anything else will not heal.
+            if !Self.isBusy(db, error) { turnOff() }
         }
     }
 
@@ -284,16 +298,16 @@ public final class UsageLog: @unchecked Sendable {
         case failed
     }
 
-    private func openIfNeeded(budget: TimeInterval) -> Opening {
+    private func openIfNeeded(deadline: TimeInterval) -> Opening {
         switch state {
         case .off: return .failed
         case .open:
             if let database { return .opened(database) }
             state = .closed
-            return openIfNeeded(budget: budget)
+            return openIfNeeded(deadline: deadline)
         case .closed:
             do {
-                let db = try open(budget: budget)
+                let db = try open(deadline: deadline)
                 database = db
                 state = .open
                 return .opened(db)
@@ -308,8 +322,7 @@ public final class UsageLog: @unchecked Sendable {
     private struct Busy: Error {}
     private struct NotOurs: Error {}
 
-    private func open(budget: TimeInterval) throws -> Database {
-        let deadline = Date().addingTimeInterval(budget)
+    private func open(deadline: TimeInterval) throws -> Database {
         let folder = (path as NSString).deletingLastPathComponent
         if createFolder {
             try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
@@ -320,9 +333,10 @@ public final class UsageLog: @unchecked Sendable {
         let db = try Database(path: path)
         do {
             do {
-                try Self.prepare(db, deadline: deadline, waitMillis: max(1, min(250, Int(budget * 250))))
+                try Self.prepare(db, deadline: deadline)
             } catch {
-                if db.lastFailureWasBusy { throw Busy() }
+                // NotOurs is a verdict on the file, whatever lock failure came before it.
+                if Self.isBusy(db, error) { throw Busy() }
                 throw error
             }
             if let days = retentionDays {
@@ -339,10 +353,10 @@ public final class UsageLog: @unchecked Sendable {
 
     /// Checks that the file is this log, or empty, and sets it up. Several processes may do this
     /// to one new file at the same moment.
-    /// `waitMillis` is the busy timeout of each statement, kept well below the budget so one
-    /// statement cannot overrun it.
-    private static func prepare(_ db: Database, deadline: Date, waitMillis: Int) throws {
-        try db.execute("PRAGMA busy_timeout = \(waitMillis)")
+    /// The connection never waits inside SQLite (`busy_timeout` 0, which it keeps for the writes
+    /// that follow): a locked statement fails at once and `retrying` waits, against `deadline`.
+    private static func prepare(_ db: Database, deadline: TimeInterval) throws {
+        try db.execute("PRAGMA busy_timeout = 0")
         // One snapshot for all three: a file another process is setting up is then seen as empty
         // or as finished, never as half of each, which would look like somebody else's file.
         let identity = try retrying(db, until: deadline) { try readIdentity(db) }
@@ -383,18 +397,29 @@ public final class UsageLog: @unchecked Sendable {
         }
     }
 
-    /// Runs `body` again while it fails on a lock another connection holds, until `deadline`.
+    /// Whether `error` is SQLite giving up on a lock another connection holds. `lastFailureWasBusy`
+    /// is only the last SQLite failure, so it must not colour errors that did not come from SQLite
+    /// (`NotOurs`): a verdict on the file stays one even after an earlier BUSY.
+    private static func isBusy(_ db: Database, _ error: Error) -> Bool {
+        guard error is TroyError else { return false }
+        return db.lastFailureWasBusy
+    }
+
+    /// Runs `body` again while it fails on a lock another connection holds, until the monotonic
+    /// `deadline` (seconds of `uptime`). The first attempt is always made. Each pause is short,
+    /// capped by what is left, and the time is read again after it, so a sleep that overshoots ends
+    /// the loop instead of adding up.
     @discardableResult
-    private static func retrying<T>(_ db: Database, until deadline: Date, _ body: () throws -> T) throws -> T {
-        var pause: UInt32 = 1_000
+    private static func retrying<T>(_ db: Database, until deadline: TimeInterval, _ body: () throws -> T) throws -> T {
+        var pause: UInt32 = 1_000  // microseconds
         while true {
             do {
                 return try body()
             } catch {
-                let left = deadline.timeIntervalSinceNow
-                guard db.lastFailureWasBusy, left > 0 else { throw error }
-                usleep(min(pause + UInt32.random(in: 0...pause), UInt32(left * 1_000_000)))
-                guard Date() < deadline else { throw error }
+                let remaining = deadline - uptime
+                guard isBusy(db, error), remaining > 0 else { throw error }
+                usleep(UInt32(max(1, min(Double(pause + UInt32.random(in: 0...pause)), remaining * 1_000_000))))
+                guard uptime < deadline else { throw error }
                 pause = min(pause * 2, 20_000)
             }
         }
