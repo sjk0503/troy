@@ -17,7 +17,8 @@ jobs:
         run: swift build
 
       - name: Test
-        run: swift test
+        # Keep unrelated suites from competing with the SQLite lock timing checks on hosted runners.
+        run: swift test --no-parallel
 
       - name: Assemble app
         run: Scripts/build-app.sh
